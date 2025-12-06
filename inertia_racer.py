@@ -4,6 +4,7 @@ import numpy as np
 import pygame
 from stable_baselines3 import PPO
 import os
+from datetime import datetime
 
 # ==========================================
 # 1. 환경 정의 (Physics & Game Logic)
@@ -24,9 +25,9 @@ class InertiaRacerEnv(gym.Env):
         self.SCREEN_SIZE = 800
         self.AGENT_RADIUS = 10
         self.TARGET_RADIUS = 15
-        self.MAX_SPEED = 15.0
-        self.ACCEL_POWER = 0.5
-        self.FRICTION = 0.98  # 공기 저항 (1.0이면 저항 없음)
+        self.MAX_SPEED = 150.0
+        self.ACCEL_POWER = 1.0
+        self.FRICTION = 0.92  # 공기 저항 (1.0이면 저항 없음)
         
         self.render_mode = render_mode
         self.screen = None
@@ -99,17 +100,38 @@ class InertiaRacerEnv(gym.Env):
         to_target = self.target_A - self.pos
         dist_to_target = np.linalg.norm(to_target)
         current_speed = np.linalg.norm(self.vel)
-        if current_speed<3:
-            reward-=0.03
-        if current_speed<0.1:
-            reward-=0.5
-        # --- 방향 페널티 로직 추가 ---
-        if current_speed > 0.01: # 멈춰있지 않을 때만 계산
-            # 코사인 유사도 계산: (A . B) / (|A| * |B|)
-            # 결과값: 1.0(정면) ~ -1.0(반대)
+        if current_speed<0.05:
+            reward-=40
+            
+            
+        # --- 방향 페널티 로직 (속도 고려 버전) ---
+        if current_speed > 0.1: # 멈춰있지 않을 때만 계산
+            # 1. 코사인 유사도 (방향): 1.0(정면) ~ -1.0(반대)
             cosine_sim = np.dot(self.vel, to_target) / (current_speed * dist_to_target + 1e-8)
-            # 목표를 향하면 +, 등지면 -가 됨.
-            reward += cosine_sim * (cosine_sim**2)**0.25 * 0.1
+            
+            # 2. 방향이 맞을 때만(+), 거리와 속도 궁합을 봅니다
+            if cosine_sim > 0:
+                # (1) 거리 계수 (Distance Factor)
+                # 300px 이상이면 "멀다(1.0)", 가까우면 "가깝다(0.0)"
+                # 300.0은 제동이 필요한 거리 기준 (튜닝 가능)
+                dist_factor = np.clip(dist_to_target / 300.0, 0.0, 1.0)
+                
+                # (2) 속도 계수 (Speed Ratio)
+                speed_ratio = current_speed / 30
+                
+                # (3) 상황별 점수 (Mix)
+                # - 멀다(1.0) -> 빠를수록(1.0) 점수 높음
+                # - 가깝다(0.0) -> 느릴수록(0.0) 점수 높음 (1 - speed_ratio)
+                speed_score = (dist_factor * speed_ratio) + ((1.0 - dist_factor) * (1.0 - speed_ratio))
+                
+                # 최종 보상: 방향(1.0) * 속도적절성(1.0) * 가중치(0.1)
+                # 방향도 맞고, 거리에 맞는 속도라면 점수를 줌
+                reward += cosine_sim * speed_score * 0.1
+            
+            else:
+                # 방향이 틀렸으면(-), 그냥 감점 (속도 고려 없이 단순하게)
+                # 잘못된 방향으로 빨리 가는 건 최악이므로 페널티를 줌
+                reward += cosine_sim * 0.05
         
         if self.pos[0] < 0 or self.pos[0] > self.SCREEN_SIZE:
             self.vel[0] = 0
@@ -126,7 +148,7 @@ class InertiaRacerEnv(gym.Env):
         
         if dist_to_A < (self.AGENT_RADIUS + self.TARGET_RADIUS):
             # --- [기본 보상] ---
-            reward += 15.0 # 획득 점수
+            reward += 35.0 # 획득 점수
             self.score += 1
             
             # --- [추가된 부분: 관성 보너스 (Alignment Bonus)] ---
@@ -153,7 +175,7 @@ class InertiaRacerEnv(gym.Env):
                     # (1) 거리 계수 (Distance Factor) 계산
                     # 300px 이상이면 "멀다(1.0)", 0px에 가까우면 "가깝다(0.0)"
                     # 300.0은 튜닝 가능한 상수 (화면 크기 800 기준 적절한 제동 거리)
-                    dist_factor = np.clip(dist_A_to_B / 300.0, 0.0, 1.0)
+                    dist_factor = np.clip(dist_A_to_B / 400.0, 0.0, 1.0)
                     
                     # (2) 속도 계수 (Speed Ratio) 계산 (0.0 ~ 1.0)
                     speed_ratio = current_speed / self.MAX_SPEED
@@ -165,7 +187,7 @@ class InertiaRacerEnv(gym.Env):
                     
                     # 최종 보너스: (방향 정확도) * (거리별 적절 속도) * 가중치
                     # 예: 방향 완벽(1.0) * 속도 적절(1.0) * 15.0 = 15점 추가
-                    bonus = alignment * speed_score * 30.0
+                    bonus = alignment * speed_score * 40.0
                     reward += bonus
 
             # -------------------------------------------------------
@@ -174,15 +196,15 @@ class InertiaRacerEnv(gym.Env):
             self.target_A = self.target_B
             self.target_B = self._spawn_target()
             
-        else:
-            # 쉐이핑 보상: 목표물에 다가갈수록 약간의 점수 (학습 초반용)
-            # 속도 벡터와 목표물 방향 벡터의 내적(Dot Product)을 사용
-            to_target = self.target_A - self.pos
-            to_target /= (np.linalg.norm(to_target) + 1e-5) # 단위벡터
-            velocity_towards_target = np.dot(self.vel, to_target)
-            
-            if velocity_towards_target > 0:
-                reward += 0.05 * (velocity_towards_target / self.MAX_SPEED)
+        # else:
+        #     # 쉐이핑 보상: 목표물에 다가갈수록 약간의 점수 (학습 초반용)
+        #     # 속도 벡터와 목표물 방향 벡터의 내적(Dot Product)을 사용
+        #     to_target = self.target_A - self.pos
+        #     to_target /= (np.linalg.norm(to_target) + 1e-5) # 단위벡터
+        #     velocity_towards_target = np.dot(self.vel, to_target)
+
+        #     if velocity_towards_target > 0:
+        #         reward += 0.005 * (velocity_towards_target / self.MAX_SPEED)
 
         # 4. 종료 조건
         terminated = False
@@ -232,12 +254,21 @@ class InertiaRacerEnv(gym.Env):
             
             # 속도가 빠르면(10 이상) 노란색, 아니면 하늘색으로 표시
             color = (255, 255, 0) if current_speed > 10.0 else (0, 255, 255)
+            if current_speed<0.05: color=(255,0,0)
             
             speed_surf = font.render(f"Speed: {current_speed:.2f}", True, color)
             self.screen.blit(speed_surf, (10, 35)) # 점수 바로 아래(y=35)에 배치
             
+            step_color = (200, 200, 200)
+            if self.steps > self.max_steps * 0.9:
+                step_color = (255, 100, 100)
+                
+            step_surf = font.render(f"Step: {self.steps}/{self.max_steps}", True, step_color)
+            self.screen.blit(step_surf, (10, 60)) # 속도 아래(y=60)에 배치
+            
             pygame.display.flip()
             self.clock.tick(self.metadata["render_fps"])
+            
 
     def close(self):
         if self.screen is not None:
@@ -247,7 +278,8 @@ class InertiaRacerEnv(gym.Env):
 # 2. 메인 실행 코드 (학습 및 테스트)
 # ==========================================
 if __name__ == "__main__":
-    MODEL_PATH = "model_prod_minv3_30.zip"
+    current_time = datetime.now().strftime("%Y%m%d%H%M%S")
+    MODEL_PATH = f"exp/model_{current_time}.zip"
     
     # 환경 생성
     env = InertiaRacerEnv(render_mode="human") # 학습 시엔 "rgb_array" 권장하나, 보는 맛을 위해 human
@@ -258,13 +290,13 @@ if __name__ == "__main__":
         print(">>> 학습 중에는 화면이 뜨지 않거나 검게 보일 수 있습니다.")
         
         # 시각화 없이 빠르게 학습하기 위해 더미 환경 생성
-        train_env = InertiaRacerEnv(render_mode=None)
+        train_env = InertiaRacerEnv(render_mode="human")
         
         # PPO 모델 생성
         model = PPO("MlpPolicy", train_env, verbose=1, learning_rate=0.0003)
         
         # 학습 실행 (약 3~5분 소요, steps를 늘리면 더 똑똑해짐)
-        model.learn(total_timesteps=200000)
+        model.learn(total_timesteps=300000)
         
         # 저장
         model.save(MODEL_PATH)
