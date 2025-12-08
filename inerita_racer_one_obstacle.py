@@ -16,11 +16,16 @@ class InertiaRacerEnv(gym.Env):
     - 행동: X, Y축 가속도 조절
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
-
-    def __init__(self, render_mode=None):
+    #p_obs_gain=40.633, p_safety_margin=1.8837, p_lookahead=3.616, p_shaping=2.4
+    def __init__(self, render_mode=None, p_obs_gain=64.6305, p_safety_margin=1.9193, p_lookahead=199.8128, p_shaping=3.4954):
         super(InertiaRacerEnv, self).__init__()
         
         # --- 설정 상수 ---
+        self.p_obs_gain = p_obs_gain
+        self.p_safety_margin = p_safety_margin
+        self.p_lookahead = p_lookahead
+        self.p_shaping = p_shaping
+
         self.SCREEN_SIZE = 800
         self.AGENT_RADIUS = 10
         self.TARGET_RADIUS = 15
@@ -92,84 +97,141 @@ class InertiaRacerEnv(gym.Env):
     def step(self, action):
         self.steps += 1
         
-        # 1. 물리 엔진 (동일)
+        # 1. 물리 엔진
         accel = np.array(action, dtype=np.float32) * self.ACCEL_POWER
         self.vel += accel
-        
         speed = np.linalg.norm(self.vel)
         if speed > self.MAX_SPEED:
             self.vel = (self.vel / speed) * self.MAX_SPEED
-            
         self.vel *= self.FRICTION
         self.pos += self.vel
 
         # -----------------------------------------------------
-        # 2. 보상 계산
+        # 2. 보상 로직
         # -----------------------------------------------------
         reward = 0.0
         terminated = False
         
         dist_to_A = np.linalg.norm(self.pos - self.target_A)
-        dist_to_obs = np.linalg.norm(self.pos - self.obstacle_pos)
+        to_obs_vec = self.obstacle_pos - self.pos 
+        dist_to_obs = np.linalg.norm(to_obs_vec)
         
-        # [기존 유지] 거리 쉐이핑 (움직임 유도)
-        reward += (self.prev_dist_to_A - dist_to_A) * 1.0 
+        # [파라미터 1] 위험 감지 거리 (대폭 상향)
+        # 관성이 있으므로 150px은 너무 짧습니다. 300px 이상 봐야 미리 피합니다.
+        # 속도에 비례해서 더 멀리 보게 설정 (Dynamic Lookahead)
+        detection_radius = self.obstacle_radius + self.AGENT_RADIUS + self.p_lookahead + (speed * 10.0)
+        is_in_danger = dist_to_obs < detection_radius
+
+        # 거리 쉐이핑 (위험할 땐 0.5배로 줄여서 생존 우선순위 높임)
+        current_shaping_weight = self.p_shaping 
+        if is_in_danger:
+            current_shaping_weight = 0.5
+        
+        reward += (self.prev_dist_to_A - dist_to_A) * current_shaping_weight
         self.prev_dist_to_A = dist_to_A
-        
-        # -----------------------------------------------------
-        # [신규 처방] 게으름 방지 페널티 (Anti-Freezing)
-        # -----------------------------------------------------
-        # 속도가 2.0 미만이면 매 프레임 -0.5점 (멈추면 죽는 것만큼 괴롭게 만듦)
-        if speed < 2.0:
-            reward -= 1.0
-        
-        # 기본 시간 페널티
-        reward -= 0.01
 
-        # -----------------------------------------------------
-        # 3. 미래 예측 경고 (유지하되 살짝 수정)
-        # -----------------------------------------------------
-        future_pos = self.pos + self.vel * 15.0
-        dist_future_to_obs = np.linalg.norm(future_pos - self.obstacle_pos)
-        
-        # 만약 "이 속도대로면 들이받는다"면 미리 경고(감점)
-        if dist_future_to_obs < (self.AGENT_RADIUS + self.obstacle_radius):
-            # 속도가 빠를수록 더 큰 공포를 느낌
-            reward -= 2.0 * (speed / self.MAX_SPEED)
+        # -------------------------------------------------------------------
+        # [핵심] 기하학적 정밀 충돌 판정 (Geometric Collision Cone)
+        # -------------------------------------------------------------------
+        if is_in_danger and speed > 0.5:
+            # 1. 현재 진행 방향과 장애물 간의 각도 (Theta Current)
+            to_obs_dir = to_obs_vec / (dist_to_obs + 1e-5)
+            vel_dir = self.vel / speed
+            
+            # 내적값(-1~1)을 각도(0~PI 라디안)로 변환
+            dot_prod = np.clip(np.dot(vel_dir, to_obs_dir), -1.0, 1.0)
+            current_angle = np.arccos(dot_prod) # 0이면 정면, PI면 반대
+            
+            # 2. 회피에 필요한 최소 각도 (Theta Limit) 계산
+            # 반지름 합(플레이어+장애물)이 차지하는 각도 계산
+            combined_radius = self.obstacle_radius + self.AGENT_RADIUS
+            
+            # arcsin 입력값 안전장치 (거리가 반지름보다 작으면 이미 겹친 것)
+            ratio = np.clip(combined_radius / (dist_to_obs + 1e-5), 0, 1.0)
+            limit_angle = np.arcsin(ratio)
+            
+            # [중요] 여유 마진 (Safety Margin)
+            # 딱 맞춰서 피하면 긁힙니다. 1.5배 정도 더 여유 있게 피하게 만듭니다.
+            safe_angle_threshold = limit_angle * self.p_safety_margin
+            
+            # 3. 충돌 코스 판정
+            # "현재 각도가 안전 각도보다 작으면" -> 충돌 코스임
+            if current_angle < safe_angle_threshold:
+                
+                # [파라미터 2] 공포 계수 (여전히 강력하게)
+                current_obs_gain = self.p_obs_gain
+                
+                # (1) 각도 위반 정도 (얼마나 정면인가?)
+                # 0(정면)일수록 큼, 경계선일수록 작음
+                angle_penetration = (safe_angle_threshold - current_angle) / safe_angle_threshold
+                
+                # (2) 거리 위협 정도 (가까울수록 급격히 커짐)
+                dist_factor = (detection_radius - dist_to_obs) / detection_radius
+                
+                # (3) 속도 위협 정도 (빠르면 더 위험)
+                speed_factor = speed / self.MAX_SPEED
+                
+                # 최종 페널티: 각도 * 거리 * 속도 * 가중치
+                penalty = angle_penetration * dist_factor * speed_factor * current_obs_gain
+                reward -= penalty
+                
+                # 4. [정면 충돌 방지] 브레이크 보상 유도
+                # 충돌 코스인데 속도가 빠르면, "가속 페달을 밟는 것" 자체를 처벌
+                # 반대로 감속하면 처벌 안 함 (브레이크 유도)
+                accel_magnitude = np.linalg.norm(accel)
+                if accel_magnitude > 0:
+                    # 가속 방향이 장애물 쪽이면 2배 처벌
+                    if np.dot(accel, to_obs_dir) > 0:
+                        reward -= penalty * 1.0
+                    else:
+                        reward -= penalty * 0.2 # 회피 가속은 조금만 처벌
 
-        # -----------------------------------------------------
-        # 4. 충돌 처리 (즉사)
-        # -----------------------------------------------------
+        # -------------------------------------------------------------------
+
+        # 3. 충돌 처리 (즉사)
         if dist_to_obs < (self.AGENT_RADIUS + self.obstacle_radius):
-            reward -= 500.0  # 절대 금기
+            reward -= 500.0 # 타협 없는 죽음
             terminated = True
             return self._get_obs(), reward, terminated, False, {}
-
-        # 벽 충돌
+        
+        # 4. 벽 및 시간 페널티
+        reward -= 0.01 
+        
         hit_wall = False
-        if self.pos[0] < 0: self.pos[0] = 0; self.vel[0] *= -0.5; hit_wall = True
-        if self.pos[0] > self.SCREEN_SIZE: self.pos[0] = self.SCREEN_SIZE; self.vel[0] *= -0.5; hit_wall = True
-        if self.pos[1] < 0: self.pos[1] = 0; self.vel[1] *= -0.5; hit_wall = True
-        if self.pos[1] > self.SCREEN_SIZE: self.pos[1] = self.SCREEN_SIZE; self.vel[1] *= -0.5; hit_wall = True
+        for i in range(2):
+            if self.pos[i] < 0: 
+                self.pos[i] = 0; self.vel[i] *= -0.5; hit_wall = True
+            if self.pos[i] > self.SCREEN_SIZE: 
+                self.pos[i] = self.SCREEN_SIZE; self.vel[i] *= -0.5; hit_wall = True
         
         if hit_wall:
-            reward -= 5.0 # 벽에 붙어서 멈추는 꼼수 방지 (벽도 아프게)
+            reward -= 2.0
 
-        # -----------------------------------------------------
         # 5. 목표 획득
-        # -----------------------------------------------------
         if dist_to_A < (self.AGENT_RADIUS + self.TARGET_RADIUS):
-            reward += 25.0 # 점수 획득
+            reward += 30.0
             self.score += 1
             
-            # 목표 교체
+            # Alignment Bonus (속도감 유지)
+            vec_A_to_B = self.target_B - self.target_A
+            dist_A_to_B = np.linalg.norm(vec_A_to_B)
+            
+            if dist_A_to_B > 0 and speed > 0.1:
+                dir_A_to_B = vec_A_to_B / dist_A_to_B
+                vel_dir = self.vel / speed
+                alignment = np.dot(vel_dir, dir_A_to_B)
+                
+                if alignment > 0:
+                    reward += alignment * (speed / self.MAX_SPEED) * 20.0
+
             self.target_A = self.target_B
             self.target_B = self._spawn_target()
             self.prev_dist_to_A = np.linalg.norm(self.pos - self.target_A)
-
+        
         truncated = self.steps >= self.max_steps
         
         return self._get_obs(), reward, terminated, truncated, {}
+    
 
     def render(self):
         if self.render_mode == "human":
@@ -247,9 +309,9 @@ if __name__ == "__main__":
         model = PPO("MlpPolicy", train_env, verbose=1, learning_rate=0.0003)
         
         # 학습 실행 (약 3~5분 소요, steps를 늘리면 더 똑똑해짐)
-        model.learn(total_timesteps=400000)
+        model.learn(total_timesteps=100000)
         
-        # 저장
+        # 저장 (현재는 안함)
         model.save(MODEL_PATH)
         print(">>> 학습 완료 및 저장됨!")
         train_env.close()

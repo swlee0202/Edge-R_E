@@ -6,9 +6,6 @@ from stable_baselines3 import PPO
 import os
 from datetime import datetime
 
-# ==========================================
-# 1. 환경 정의 (Physics & Game Logic)
-# ==========================================
 class InertiaRacerEnv(gym.Env):
     """
     관성 주행 환경
@@ -166,7 +163,6 @@ class InertiaRacerEnv(gym.Env):
                 dir_A_to_B = vec_A_to_B / dist_A_to_B
                 dir_vel = self.vel / current_speed
                 
-            
                 # 3. 내적(Dot Product) 계산
                 alignment = np.dot(dir_vel, dir_A_to_B)
                 
