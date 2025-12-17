@@ -1,3 +1,4 @@
+import os
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -109,29 +110,55 @@ class InertiaRacerEnv(gym.Env):
         return np.array(ray_readings, dtype=np.float32)
 
     def _get_blocking_obstacle(self):
+        # 검사할 두 가지 경로 벡터
+        check_vectors = []
+        
+        # 1. 목표물로 가는 벡터 (의도)
         to_target = self.target - self.pos
         dist_target = np.linalg.norm(to_target)
-        if dist_target == 0: return None
-        
-        dir_target = to_target / dist_target
-        closest_blocking_obs = None
+        if dist_target > 0:
+            check_vectors.append((to_target / dist_target, dist_target))
+            
+        # 2. 현재 속도로 미끄러지는 벡터 (현실 - 관성 예측)
+        speed = np.linalg.norm(self.vel)
+        if speed > 10.0: # 속도가 어느 정도 있을 때만 예측
+            # 1.5초 뒤의 위치까지 미리 검사 (속도가 빠를수록 멀리 봄)
+            prediction_dist = speed * 1.5 
+            check_vectors.append((self.vel / speed, prediction_dist))
+
+        closest_obs = None
         min_dist_to_obs = float('inf')
 
         for obs in self.obstacles:
-            to_obs = obs - self.pos
-            proj = np.dot(to_obs, dir_target)
+            is_blocking = False
             
-            if 0 < proj < dist_target:
-                perp_dist = np.linalg.norm(to_obs - (dir_target * proj))
-                # 여유 공간 (이 안으로 들어오면 길이 막힌 것으로 간주)
-                safety_margin = self.OBSTACLE_RADIUS + self.AGENT_RADIUS + 40.0
+            for direction, max_dist in check_vectors:
+                to_obs = obs - self.pos
                 
-                if perp_dist < safety_margin:
-                    dist_to_obs = np.linalg.norm(to_obs)
-                    if dist_to_obs < min_dist_to_obs:
-                        min_dist_to_obs = dist_to_obs
-                        closest_blocking_obs = obs
-        return closest_blocking_obs
+                # 벡터 내적 (Projection)으로 직선 거리 계산
+                proj = np.dot(to_obs, direction)
+                
+                # 장애물이 내 뒤에 있거나(proj < 0), 검사 범위보다 멀면(proj > max_dist) 패스
+                if proj <= 0 or proj >= max_dist:
+                    continue
+                
+                # 직선 경로와 장애물 중심 사이의 수직 거리(Perpendicular Distance)
+                closest_point_on_line = direction * proj
+                perp_dist = np.linalg.norm(to_obs - closest_point_on_line)
+                
+                collision_threshold = self.OBSTACLE_RADIUS + self.AGENT_RADIUS + 15.0 
+                
+                if perp_dist < collision_threshold:
+                    is_blocking = True
+                    break # 하나의 경로라도 막히면 이 장애물은 위험함
+            
+            if is_blocking:
+                dist_to_obs = np.linalg.norm(obs - self.pos)
+                if dist_to_obs < min_dist_to_obs:
+                    min_dist_to_obs = dist_to_obs
+                    closest_obs = obs
+                    
+        return closest_obs
 
     def _get_detour_point(self, blocking_obs):
         # [수정 1] 역주행 방지 및 명확한 경로 선정
@@ -343,28 +370,29 @@ class InertiaRacerEnv(gym.Env):
         if self.screen is not None: pygame.quit()
 
 if __name__ == "__main__":
-    current_time = datetime.now().strftime("%Y%m%D%H%M%S")
-    MODEL_PATH = f"exp/smart_path_last_hope_{current_time}"
+    current_time = 153848
+    MODEL_PATH = f"exp/smart_path_last_hope_153848.zip"
     
-    env = InertiaRacerEnv()
-    vec_env = DummyVecEnv([lambda: env])
-    vec_env = VecFrameStack(vec_env, n_stack=4)
-    
-    print(">>> Training (Fixing Orbiting & Wall Hugging)...")
-    
-    model = PPO(
-        "MlpPolicy", 
-        vec_env, 
-        verbose=1, 
-        learning_rate=0.0003, 
-        n_steps=2048,
-        batch_size=64,
-        ent_coef=0.01,
-        policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])])
-    )
-    
-    model.learn(total_timesteps=500000)
-    model.save(MODEL_PATH)
+    if not os.path.exists(MODEL_PATH):
+        env = InertiaRacerEnv()
+        vec_env = DummyVecEnv([lambda: env])
+        vec_env = VecFrameStack(vec_env, n_stack=4)
+        
+        print(">>> Training (Fixing Orbiting & Wall Hugging)...")
+        
+        model = PPO(
+            "MlpPolicy", 
+            vec_env, 
+            verbose=1, 
+            learning_rate=0.0003, 
+            n_steps=2048,
+            batch_size=64,
+            ent_coef=0.01,
+            policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])])
+        )
+        
+        model.learn(total_timesteps=500000)
+        model.save(MODEL_PATH)
     
     print(">>> Testing...")
     test_env = InertiaRacerEnv(render_mode="human")
